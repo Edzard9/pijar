@@ -1,5 +1,5 @@
-import {copyFile, readdir, readFile, writeFile} from 'node:fs/promises';
-import {spawn} from 'node:child_process';
+import {copyFile, readdir, readFile, stat, writeFile} from 'node:fs/promises';
+import {execFile, spawn} from 'node:child_process';
 import {createInterface} from 'node:readline/promises';
 import {stdin, stdout} from 'node:process';
 import path from 'node:path';
@@ -11,14 +11,17 @@ const skip = new Set(['Root.tsx', 'Root.tsx.bak', 'index.ts', 'index.tsx']);
 
 async function scan() {
   const entries = await readdir(src, {withFileTypes: true});
-  const files = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.tsx'))
-    .map((entry) => entry.name)
-    .filter((name) => !skip.has(name) && !name.endsWith('.bak') && !name.includes('.generated.'))
-    .sort();
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.tsx')) continue;
+    if (skip.has(entry.name) || entry.name.endsWith('.bak') || entry.name.includes('.generated.')) continue;
+    const info = await stat(path.join(src, entry.name));
+    files.push({name: entry.name, mtimeMs: info.mtimeMs});
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
   const compositions = [];
 
-  for (const file of files) {
+  for (const {name: file, mtimeMs} of files) {
     const id = path.basename(file, '.tsx');
     const source = await readFile(path.join(src, file), 'utf8');
     const exported = new Set(
@@ -28,7 +31,7 @@ async function scan() {
       console.log(`Peringatan: ${file} dilewati, tidak mengekspor ${id}.`);
       continue;
     }
-    compositions.push({id, file: `./${id}`, exported, source});
+    compositions.push({id, file: `./${id}`, exported, source, mtimeMs});
   }
 
   return compositions;
@@ -110,6 +113,35 @@ function outputName(composition) {
   return raw.replace(/^['"]|['"]$/g, '');
 }
 
+function glRenderer() {
+  if (process.platform === 'win32') return {value: 'angle', label: 'GPU (ANGLE/Direct3D) untuk NVIDIA, AMD, dan Intel'};
+  if (process.platform === 'darwin') return {value: 'angle', label: 'GPU (ANGLE/Metal) untuk Mac Intel dan Apple Silicon (M series)'};
+  return {value: 'egl', label: 'GPU (EGL)'};
+}
+
+function detectGpuNames() {
+  return new Promise((resolve) => {
+    if (process.platform === 'darwin') {
+      execFile('sysctl', ['-n', 'machdep.cpu.brand_string'], {timeout: 4000}, (error, stdout) => {
+        if (error) return resolve([]);
+        const name = stdout.trim();
+        resolve(name ? [name] : []);
+      });
+      return;
+    }
+    if (process.platform !== 'win32') return resolve([]);
+    execFile(
+      'powershell',
+      ['-NoProfile', '-Command', 'Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }'],
+      {timeout: 4000, windowsHide: true},
+      (error, stdout) => {
+        if (error) return resolve([]);
+        resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+      }
+    );
+  });
+}
+
 function spawnStep(args) {
   return new Promise((resolve, reject) => {
     const child = spawn('npx', args, {cwd: root, shell: true, stdio: 'inherit'});
@@ -118,35 +150,94 @@ function spawnStep(args) {
   });
 }
 
-const compositions = await scan();
-await writeRoot(compositions);
-if (process.argv.includes('--gen')) process.exit(0);
-
-compositions.forEach((composition, index) => {
-  const duration = displayValue(composition.source, ['TOTAL_FRAMES', 'DURATION_FRAMES'], '90');
-  const fps = displayValue(composition.source, ['FPS'], '30');
-  const width = displayValue(composition.source, ['WIDTH', 'W'], '1080');
-  const height = displayValue(composition.source, ['HEIGHT', 'H'], '1920');
-  console.log(`  ${index + 1}. ${composition.id} - ${duration} frame, ${fps} fps, ${width}x${height}, ${outputName(composition)}`);
-});
+if (process.argv.includes('--gen')) {
+  const compositions = await scan();
+  await writeRoot(compositions);
+  process.exit(0);
+}
 
 const prompt = createInterface({input: stdin, output: stdout});
-const choice = (await prompt.question('Pilih nomor (kosong/q untuk keluar): ')).trim();
+const lineQueue = [];
+const waiters = [];
+let inputClosed = false;
+prompt.on('line', (line) => {
+  if (waiters.length) waiters.shift()(line);
+  else lineQueue.push(line);
+});
+prompt.on('close', () => {
+  inputClosed = true;
+  while (waiters.length) waiters.shift()(null);
+});
+const ask = (text) => {
+  stdout.write(text);
+  if (lineQueue.length) return Promise.resolve(lineQueue.shift().trim());
+  if (inputClosed) return Promise.resolve(null);
+  return new Promise((resolve) => waiters.push((value) => resolve(value === null ? null : value.trim())));
+};
+
+let selesai = false;
+while (!selesai) {
+  const compositions = await scan();
+  await writeRoot(compositions);
+  if (!compositions.length) {
+    console.log('Tidak ada komposisi ditemukan di src.');
+    break;
+  }
+  console.log('Komposisi ditemukan, terbaru di atas:');
+  compositions.forEach((composition, index) => {
+    const duration = displayValue(composition.source, ['TOTAL_FRAMES', 'DURATION_FRAMES'], '90');
+    const fps = displayValue(composition.source, ['FPS'], '30');
+    const width = displayValue(composition.source, ['WIDTH', 'W'], '1080');
+    const height = displayValue(composition.source, ['HEIGHT', 'H'], '1920');
+    console.log(`  ${index + 1}. ${composition.id} - ${duration} frame, ${fps} fps, ${width}x${height}, ${outputName(composition)}`);
+  });
+
+  const choice = await ask('Pilih nomor (kosong/q untuk keluar): ');
+  if (choice === null || !choice || choice.toLowerCase() === 'q') break;
+  const selected = Number(choice);
+  if (!Number.isInteger(selected) || selected < 1 || selected > compositions.length) {
+    console.log('Pilihan tidak valid.');
+    continue;
+  }
+  const composition = compositions[selected - 1];
+
+  console.log('Memeriksa tipe...');
+  const typecheck = await spawnStep(['tsc', '--noEmit']);
+  if (typecheck !== 0) {
+    console.log('Pemeriksaan tipe gagal, render dibatalkan.');
+  } else {
+    console.log(`Merender ${composition.id}...`);
+    const gl = glRenderer();
+    const gpuNames = await detectGpuNames();
+    const detLabel = process.platform === 'darwin' ? 'Chip terdeteksi' : 'GPU terdeteksi';
+    if (gpuNames.length) console.log(`${detLabel}: ${gpuNames.join(', ')}`);
+    console.log(`Mode render: ${gl.label}`);
+    const renderArgs = ['remotion', 'render', composition.id, `out\\${outputName(composition)}`];
+    let usedGpu = true;
+    let renderCode = await spawnStep([...renderArgs, `--gl=${gl.value}`]);
+    if (renderCode !== 0 && gl.value !== 'swiftshader') {
+      console.log('Render dengan GPU gagal, mencoba ulang dengan render software (CPU)...');
+      usedGpu = false;
+      renderCode = await spawnStep([...renderArgs, '--gl=swiftshader']);
+    }
+    if (renderCode === 0) {
+      const outFile = path.join(root, 'out', outputName(composition));
+      const urlPath = outFile.replace(/\\/g, '/');
+      const outUrl = urlPath.startsWith('/') ? `file://${urlPath}` : `file:///${urlPath}`;
+      console.log(`Render selesai: ${outFile}`);
+      console.log(`Klik untuk membuka video: \x1b]8;;${outUrl}\x1b\\\x1b[34;4m${outUrl}\x1b[0m\x1b]8;;\x1b\\`);
+      if (usedGpu) {
+        console.log(`Dirender dengan GPU: ${gpuNames.length ? gpuNames.join(', ') : gl.label}`);
+      } else {
+        console.log('Dirender dengan CPU (software), GPU tidak dipakai.');
+      }
+    } else {
+      console.log(`Render gagal (kode ${renderCode}).`);
+    }
+  }
+
+  const lagi = await ask('Program selesai? (y/n): ');
+  if (lagi === null || lagi.toLowerCase() === 'y' || lagi.toLowerCase() === 'ya') selesai = true;
+}
 prompt.close();
-if (!choice || choice.toLowerCase() === 'q') process.exit(0);
-const selected = Number(choice);
-if (!Number.isInteger(selected) || selected < 1 || selected > compositions.length) {
-  console.log('Pilihan tidak valid.');
-  process.exit(1);
-}
-
-console.log('Memeriksa tipe...');
-const typecheck = await spawnStep(['tsc', '--noEmit']);
-if (typecheck !== 0) {
-  console.log('Pemeriksaan tipe gagal, render dibatalkan.');
-  process.exit(typecheck);
-}
-
-const composition = compositions[selected - 1];
-console.log(`Merender ${composition.id}...`);
-process.exit(await spawnStep(['remotion', 'render', composition.id, `out\\${outputName(composition)}`]));
+console.log('Program selesai. Sampai jumpa.');
