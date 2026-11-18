@@ -113,6 +113,54 @@ function outputName(composition) {
   return raw.replace(/^['"]|['"]$/g, '');
 }
 
+function formatSeconds(composition) {
+  const frames = Number(displayValue(composition.source, ['TOTAL_FRAMES', 'DURATION_FRAMES'], '90'));
+  const fps = Number(displayValue(composition.source, ['FPS'], '30'));
+  if (!Number.isFinite(frames) || !Number.isFinite(fps) || fps <= 0) return '';
+  const seconds = frames / fps;
+  const text = Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1).replace('.', ',');
+  return ` (${text} dtk)`;
+}
+
+async function renderStatus(composition) {
+  try {
+    const info = await stat(path.join(root, 'out', outputName(composition)));
+    return info.mtimeMs >= composition.mtimeMs ? 'sudah dirender' : 'perlu render ulang';
+  } catch {
+    return 'belum dirender';
+  }
+}
+
+function assetRefs(source) {
+  const refs = [];
+  for (const match of source.matchAll(/\bstaticFile\(\s*([^)]*?)\s*\)/g)) {
+    const arg = match[1].trim();
+    const literal = arg.match(/^(['"`])([^'"`]+)\1$/);
+    if (literal) {
+      if (literal[1] === '`' && literal[2].includes('${')) continue;
+      refs.push(literal[2]);
+      continue;
+    }
+    if (/^[A-Za-z_$][\w$]*$/.test(arg)) {
+      const found = source.match(new RegExp(`\\bconst\\s+${arg}\\s*=\\s*(['"\`])([^'"\`]+)\\1`));
+      if (found) refs.push(found[2]);
+    }
+  }
+  return [...new Set(refs)];
+}
+
+async function missingAssets(composition) {
+  const missing = [];
+  for (const ref of assetRefs(composition.source)) {
+    try {
+      await stat(path.join(root, 'public', ref));
+    } catch {
+      missing.push(ref);
+    }
+  }
+  return missing;
+}
+
 function glRenderer() {
   if (process.platform === 'win32') return {value: 'angle', label: 'GPU (ANGLE/Direct3D) untuk NVIDIA, AMD, dan Intel'};
   if (process.platform === 'darwin') return {value: 'angle', label: 'GPU (ANGLE/Metal) untuk Mac Intel dan Apple Silicon (M series)'};
@@ -150,6 +198,34 @@ function spawnStep(args) {
   });
 }
 
+async function renderComposition(composition, gl, gpuNames) {
+  console.log(`Merender ${composition.id}...`);
+  console.log(`Mode render: ${gl.label}`);
+  const renderArgs = ['remotion', 'render', composition.id, `out\\${outputName(composition)}`];
+  let usedGpu = true;
+  let renderCode = await spawnStep([...renderArgs, `--gl=${gl.value}`]);
+  if (renderCode !== 0 && gl.value !== 'swiftshader') {
+    console.log('Render dengan GPU gagal, mencoba ulang dengan render software (CPU)...');
+    usedGpu = false;
+    renderCode = await spawnStep([...renderArgs, '--gl=swiftshader']);
+  }
+  if (renderCode === 0) {
+    const outFile = path.join(root, 'out', outputName(composition));
+    const urlPath = outFile.replace(/\\/g, '/');
+    const outUrl = urlPath.startsWith('/') ? `file://${urlPath}` : `file:///${urlPath}`;
+    console.log(`Render selesai: ${outFile}`);
+    console.log(`Klik untuk membuka video: \x1b]8;;${outUrl}\x1b\\\x1b[34;4m${outUrl}\x1b[0m\x1b]8;;\x1b\\`);
+    if (usedGpu) {
+      console.log(`Dirender dengan GPU: ${gpuNames.length ? gpuNames.join(', ') : gl.label}`);
+    } else {
+      console.log('Dirender dengan CPU (software), GPU tidak dipakai.');
+    }
+    return true;
+  }
+  console.log(`Render gagal (kode ${renderCode}).`);
+  return false;
+}
+
 if (process.argv.includes('--gen')) {
   const compositions = await scan();
   await writeRoot(compositions);
@@ -184,55 +260,77 @@ while (!selesai) {
     break;
   }
   console.log('Komposisi ditemukan, terbaru di atas:');
-  compositions.forEach((composition, index) => {
+  for (const [index, composition] of compositions.entries()) {
     const duration = displayValue(composition.source, ['TOTAL_FRAMES', 'DURATION_FRAMES'], '90');
     const fps = displayValue(composition.source, ['FPS'], '30');
     const width = displayValue(composition.source, ['WIDTH', 'W'], '1080');
     const height = displayValue(composition.source, ['HEIGHT', 'H'], '1920');
-    console.log(`  ${index + 1}. ${composition.id} - ${duration} frame, ${fps} fps, ${width}x${height}, ${outputName(composition)}`);
-  });
+    const status = await renderStatus(composition);
+    console.log(`  ${index + 1}. ${composition.id} - ${duration} frame${formatSeconds(composition)}, ${fps} fps, ${width}x${height}, ${outputName(composition)} [${status}]`);
+  }
+  console.log('  0. Render SEMUA komposisi berurutan');
 
   const choice = await ask('Pilih nomor (kosong/q untuk keluar): ');
   if (choice === null || !choice || choice.toLowerCase() === 'q') break;
-  const selected = Number(choice);
-  if (!Number.isInteger(selected) || selected < 1 || selected > compositions.length) {
-    console.log('Pilihan tidak valid.');
-    continue;
-  }
-  const composition = compositions[selected - 1];
 
-  console.log('Memeriksa tipe...');
-  const typecheck = await spawnStep(['tsc', '--noEmit']);
-  if (typecheck !== 0) {
-    console.log('Pemeriksaan tipe gagal, render dibatalkan.');
-  } else {
-    console.log(`Merender ${composition.id}...`);
-    const gl = glRenderer();
-    const gpuNames = await detectGpuNames();
-    const detLabel = process.platform === 'darwin' ? 'Chip terdeteksi' : 'GPU terdeteksi';
-    if (gpuNames.length) console.log(`${detLabel}: ${gpuNames.join(', ')}`);
-    console.log(`Mode render: ${gl.label}`);
-    const renderArgs = ['remotion', 'render', composition.id, `out\\${outputName(composition)}`];
-    let usedGpu = true;
-    let renderCode = await spawnStep([...renderArgs, `--gl=${gl.value}`]);
-    if (renderCode !== 0 && gl.value !== 'swiftshader') {
-      console.log('Render dengan GPU gagal, mencoba ulang dengan render software (CPU)...');
-      usedGpu = false;
-      renderCode = await spawnStep([...renderArgs, '--gl=swiftshader']);
-    }
-    if (renderCode === 0) {
-      const outFile = path.join(root, 'out', outputName(composition));
-      const urlPath = outFile.replace(/\\/g, '/');
-      const outUrl = urlPath.startsWith('/') ? `file://${urlPath}` : `file:///${urlPath}`;
-      console.log(`Render selesai: ${outFile}`);
-      console.log(`Klik untuk membuka video: \x1b]8;;${outUrl}\x1b\\\x1b[34;4m${outUrl}\x1b[0m\x1b]8;;\x1b\\`);
-      if (usedGpu) {
-        console.log(`Dirender dengan GPU: ${gpuNames.length ? gpuNames.join(', ') : gl.label}`);
-      } else {
-        console.log('Dirender dengan CPU (software), GPU tidak dipakai.');
-      }
+  if (choice === '0') {
+    console.log('Memeriksa tipe...');
+    const typecheck = await spawnStep(['tsc', '--noEmit']);
+    if (typecheck !== 0) {
+      console.log('Pemeriksaan tipe gagal, antrean dibatalkan.');
     } else {
-      console.log(`Render gagal (kode ${renderCode}).`);
+      const gl = glRenderer();
+      const gpuNames = await detectGpuNames();
+      const detLabel = process.platform === 'darwin' ? 'Chip terdeteksi' : 'GPU terdeteksi';
+      if (gpuNames.length) console.log(`${detLabel}: ${gpuNames.join(', ')}`);
+      let okCount = 0;
+      let failCount = 0;
+      let skipCount = 0;
+      for (const composition of compositions) {
+        const missing = await missingAssets(composition);
+        if (missing.length) {
+          console.log(`Peringatan: ${composition.id} dilewati, file aset tidak ditemukan di folder public:`);
+          for (const name of missing) console.log(`  - ${name}`);
+          skipCount++;
+          continue;
+        }
+        const ok = await renderComposition(composition, gl, gpuNames);
+        if (ok) okCount++;
+        else failCount++;
+      }
+      console.log(`Antrean selesai: ${okCount} berhasil, ${failCount} gagal, ${skipCount} dilewati.`);
+    }
+  } else {
+    const selected = Number(choice);
+    if (!Number.isInteger(selected) || selected < 1 || selected > compositions.length) {
+      console.log('Pilihan tidak valid.');
+      continue;
+    }
+    const composition = compositions[selected - 1];
+
+    const missing = await missingAssets(composition);
+    let lanjut = true;
+    if (missing.length) {
+      console.log('Peringatan: file aset berikut tidak ditemukan di folder public:');
+      for (const name of missing) console.log(`  - ${name}`);
+      console.log('Render kemungkinan gagal di tengah jalan.');
+      const tetap = await ask('Tetap render? (y/n): ');
+      lanjut = tetap !== null && (tetap.toLowerCase() === 'y' || tetap.toLowerCase() === 'ya');
+      if (!lanjut) console.log('Render dibatalkan.');
+    }
+
+    if (lanjut) {
+      console.log('Memeriksa tipe...');
+      const typecheck = await spawnStep(['tsc', '--noEmit']);
+      if (typecheck !== 0) {
+        console.log('Pemeriksaan tipe gagal, render dibatalkan.');
+      } else {
+        const gl = glRenderer();
+        const gpuNames = await detectGpuNames();
+        const detLabel = process.platform === 'darwin' ? 'Chip terdeteksi' : 'GPU terdeteksi';
+        if (gpuNames.length) console.log(`${detLabel}: ${gpuNames.join(', ')}`);
+        await renderComposition(composition, gl, gpuNames);
+      }
     }
   }
 

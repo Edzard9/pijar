@@ -10,9 +10,11 @@ Pijar adalah proyek Remotion yang dilengkapi tool kecil bernama `tools/menu.mjs`
 2. Jalankan menu:
    - Windows: klik dua kali `render.bat`.
    - Terminal: `npm run menu`.
-3. Ketik nomor komposisi yang mau dirender, tekan Enter. Daftar komposisi terurut dari file yang paling baru diubah.
+3. Ketik nomor komposisi yang mau dirender, tekan Enter. Daftar komposisi terurut dari file yang paling baru diubah. Tiap baris menampilkan durasi dalam detik dan status render dalam kurung siku: sudah dirender, perlu render ulang (file sumber lebih baru dari hasil terakhir), atau belum dirender. Ketik `0` untuk merender semua komposisi berurutan dalam sekali jalan, di akhir antrean tampil ringkasan berapa yang berhasil, gagal, dan dilewati.
 4. Hasil render masuk ke folder `out` dengan nama sesuai `OUTPUT_NAME` di file komposisi itu. Sesudah render berhasil, menu menampilkan tautan biru yang bisa diklik untuk langsung membuka videonya.
 5. Program bertanya `Program selesai? (y/n)`. Jawab `n` untuk kembali ke menu dan render lagi, jawab `y` untuk keluar.
+
+Sebelum render mulai, menu memeriksa semua aset yang dipanggil dengan `staticFile()` di komposisi pilihan, termasuk yang nama file nya ditulis lewat konstanta, dan memastikan file nya benar ada di folder `public`. Kalau ada yang hilang, menu menampilkan daftar file yang hilang dan bertanya apakah render tetap dilanjutkan, jadi kamu tahu di awal, bukan gagal di tengah render. Di mode antrean, komposisi yang asetnya hilang dilewati dan dicatat di ringkasan akhir.
 
 ## Menaruh file
 
